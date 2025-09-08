@@ -2,13 +2,15 @@ name: CI/CD - Frontend Service OneClick
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
     paths-ignore:
       - 'k8s/**'
       - 'README.md'
       - 'docs/**'
   pull_request:
-    branches: [main]
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -31,15 +33,23 @@ env:
   SERVICE_NAME: frontend
   NAMESPACE: analytics
 
+permissions:
+  contents: read
+
 jobs:
+  # ======================
+  # CI Stage - Build & Test
+  # ======================
   ci-build-test:
     runs-on: ubuntu-latest
     if: github.event.inputs.skip_tests != 'true'
     outputs:
       image-tag: ${{ steps.build-info.outputs.image-tag }}
       git-sha: ${{ steps.build-info.outputs.git-sha }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Setup Node.js v18
         uses: actions/setup-node@v4
@@ -51,18 +61,19 @@ jobs:
         run: npm ci
 
       - name: Run linter
-        continue-on-error: true
-        run: npm run lint || echo "Linting completed with warnings"
+        run: npm run lint || true   # Will not fail the workflow
 
       - name: Run tests safely
         run: |
-          set -e
+          bash -e <<'EOF'
           if npm run test:coverage 2>/dev/null; then
             echo "✅ Tests with coverage completed"
           elif npm test 2>/dev/null; then
             echo "✅ Tests completed"
           else
             echo "⚠️ No test script found, skipping tests"
+          fi
+          EOF
 
       - name: Set build info
         id: build-info
@@ -93,16 +104,21 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  # ======================
+  # CD Stage - Deploy to Kubernetes
+  # ======================
   cd-deploy:
     runs-on: self-hosted
     needs: ci-build-test
     if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_tests == 'true')
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 
       - name: Set deployment variables
         run: |
-          if [ "${{ github.event.inputs.skip_tests }}" = "true" ]; then
+          if [[ "${{ github.event.inputs.skip_tests }}" == "true" ]]; then
             IMAGE_TAG=latest
             GIT_SHA=$(git rev-parse --short HEAD)
           else
@@ -111,6 +127,7 @@ jobs:
           fi
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
+
           DEPLOY_ENV="${{ github.event.inputs.environment }}"
           echo "NAMESPACE=${DEPLOY_ENV:-analytics}" >> $GITHUB_ENV
 
@@ -122,7 +139,7 @@ jobs:
 
       - name: Setup RBAC
         run: |
-          kubectl apply -f - <<EOF || echo "Service account already exists"
+          kubectl apply -f - <<EOF || echo "RBAC already exists"
           apiVersion: v1
           kind: ServiceAccount
           metadata:
@@ -158,14 +175,20 @@ jobs:
         run: |
           IMAGE="${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           echo "Deploying frontend with image: $IMAGE"
+
+          # Replace image in temp file
           TEMP_DEPLOYMENT=$(mktemp)
           sed "s|image: tush1809/frontend:latest|image: $IMAGE|g" k8s/frontend-deployment.yaml > $TEMP_DEPLOYMENT
+
           kubectl apply -f $TEMP_DEPLOYMENT -n ${{ env.NAMESPACE }}
           rm $TEMP_DEPLOYMENT
+
+          # Wait for rollout
           kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
 
       - name: Verify Deployment
         run: |
+          echo "=== Frontend Deployment Status ==="
           kubectl get deployment frontend-deployment -n ${{ env.NAMESPACE }} -o wide
           kubectl get pods -l app=frontend -n ${{ env.NAMESPACE }} -o wide
           kubectl get svc frontend-service -n ${{ env.NAMESPACE }} -o wide
