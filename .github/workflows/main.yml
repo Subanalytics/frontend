@@ -47,6 +47,7 @@ jobs:
       image-tag: ${{ steps.build-info.outputs.image-tag }}
       git-sha: ${{ steps.build-info.outputs.git-sha }}
       should-deploy: ${{ steps.build-info.outputs.should-deploy }}
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -66,6 +67,7 @@ jobs:
 
       - name: Run tests
         run: |
+          set -e
           if npm run test:coverage 2>/dev/null; then
             echo "✅ Tests with coverage completed"
           elif npm test 2>/dev/null; then
@@ -110,23 +112,22 @@ jobs:
     runs-on: self-hosted
     needs: ci-build-test
     if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_tests == 'true')
+
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
       - name: Set deployment variables
         run: |
-          if [[ "${{ github.event.inputs.skip_tests }}" == "true" ]]; then
-            echo "IMAGE_TAG=latest" >> $GITHUB_ENV
-            echo "GIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
-          else
-            echo "IMAGE_TAG=${{ needs.ci-build-test.outputs.image-tag }}" >> $GITHUB_ENV
-            echo "GIT_SHA=${{ needs.ci-build-test.outputs.git-sha }}" >> $GITHUB_ENV
-          fi
+          IMAGE_TAG=${{ github.event.inputs.skip_tests && 'latest' || needs.ci-build-test.outputs.image-tag }}
+          GIT_SHA=${{ github.event.inputs.skip_tests && $(git rev-parse --short HEAD) || needs.ci-build-test.outputs.git-sha }}
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+          echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
+
           DEPLOY_ENV="${{ github.event.inputs.environment }}"
           echo "NAMESPACE=${DEPLOY_ENV:-analytics}" >> $GITHUB_ENV
 
-      - name: Setup Namespace and Core Infrastructure
+      - name: Setup Namespace
         run: |
           if ! kubectl get namespace ${{ env.NAMESPACE }} >/dev/null 2>&1; then
             kubectl create namespace ${{ env.NAMESPACE }}
@@ -171,12 +172,12 @@ jobs:
           IMAGE="${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           echo "Deploying frontend with image: $IMAGE"
 
-          # Use kubectl set image for safety
-          if kubectl get deployment frontend-deployment -n ${{ env.NAMESPACE }} >/dev/null 2>&1; then
-            kubectl set image deployment/frontend-deployment frontend=$IMAGE -n ${{ env.NAMESPACE }}
-          else
-            kubectl apply -f k8s/frontend-deployment.yaml -n ${{ env.NAMESPACE }}
-          fi
+          # Use `kubectl apply` safely
+          TEMP_DEPLOYMENT=$(mktemp)
+          sed "s|image: tush1809/frontend:latest|image: $IMAGE|g" k8s/frontend-deployment.yaml > $TEMP_DEPLOYMENT
+
+          kubectl apply -f $TEMP_DEPLOYMENT -n ${{ env.NAMESPACE }}
+          rm $TEMP_DEPLOYMENT
 
           # Wait for rollout
           kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
