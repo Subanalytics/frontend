@@ -1,0 +1,218 @@
+name: CI/CD - Frontend Service OneClick
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'k8s/**'
+      - 'README.md'
+      - 'docs/**'
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      skip_tests:
+        description: 'Skip tests and go straight to deployment'
+        required: false
+        type: boolean
+        default: false
+      environment:
+        description: 'Deployment environment'
+        required: false
+        default: 'analytics'
+        type: choice
+        options:
+          - analytics
+          - staging
+          - production
+
+env:
+  DOCKER_IMAGE_NAME: ${{ secrets.DOCKER_USERNAME }}/frontend
+  SERVICE_NAME: frontend
+  NAMESPACE: analytics
+
+permissions:
+  contents: read
+
+jobs:
+  # ======================
+  # CI STAGE - Build React App & Docker Push
+  # ======================
+  ci-build-test:
+    runs-on: ubuntu-latest
+    outputs:
+      image-tag: ${{ steps.build-info.outputs.image-tag }}
+      git-sha: ${{ steps.build-info.outputs.git-sha }}
+      should-deploy: ${{ steps.build-info.outputs.should-deploy }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 18
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build React app
+        run: npm run build
+
+      - name: Set build info
+        id: build-info
+        run: |
+          GIT_SHA=$(git rev-parse --short HEAD)
+          IMAGE_TAG="${GIT_SHA}-$(date +%s)"
+          echo "git-sha=$GIT_SHA" >> $GITHUB_OUTPUT
+          echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "should-deploy=true" >> $GITHUB_OUTPUT
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_HUB_TOKEN }}
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          tags: |
+            ${{ env.DOCKER_IMAGE_NAME }}:latest
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.build-info.outputs.git-sha }}
+            ${{ env.DOCKER_IMAGE_NAME }}:${{ steps.build-info.outputs.image-tag }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ======================
+  # CD STAGE - Deploy to Kubernetes
+  # ======================
+  cd-deploy:
+    runs-on: self-hosted
+    needs: ci-build-test
+    if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_tests == 'true')
+    steps:
+      - name: Checkout current repo
+        uses: actions/checkout@v4
+
+      - name: Set deployment variables
+        run: |
+          if [[ "${{ github.event.inputs.skip_tests }}" == "true" ]]; then
+            echo "IMAGE_TAG=latest" >> $GITHUB_ENV
+            echo "GIT_SHA=$(git rev-parse --short HEAD)" >> $GITHUB_ENV
+          else
+            echo "IMAGE_TAG=${{ steps.build-info.outputs.git-sha }}" >> $GITHUB_ENV
+            echo "GIT_SHA=${{ steps.build-info.outputs.git-sha }}" >> $GITHUB_ENV
+          fi
+          DEPLOY_ENV="${{ github.event.inputs.environment }}"
+          echo "NAMESPACE=${DEPLOY_ENV:-analytics}" >> $GITHUB_ENV
+
+      - name: Setup Namespace
+        run: |
+          if ! kubectl get namespace ${{ env.NAMESPACE }} >/dev/null 2>&1; then
+            kubectl create namespace ${{ env.NAMESPACE }}
+          fi
+
+      - name: Setup RBAC and Security
+        run: |
+          kubectl apply -f - <<EOF || echo "Service account exists"
+          apiVersion: v1
+          kind: ServiceAccount
+          metadata:
+            name: frontend-sa
+            namespace: ${{ env.NAMESPACE }}
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: Role
+          metadata:
+            name: frontend-role
+            namespace: ${{ env.NAMESPACE }}
+          rules:
+          - apiGroups: [""]
+            resources: ["services","pods","configmaps","secrets"]
+            verbs: ["get","list","watch"]
+          ---
+          apiVersion: rbac.authorization.k8s.io/v1
+          kind: RoleBinding
+          metadata:
+            name: frontend-rolebinding
+            namespace: ${{ env.NAMESPACE }}
+          subjects:
+          - kind: ServiceAccount
+            name: frontend-sa
+            namespace: ${{ env.NAMESPACE }}
+          roleRef:
+            kind: Role
+            name: frontend-role
+            apiGroup: rbac.authorization.k8s.io
+          EOF
+
+      - name: Deploy Frontend Service
+        run: |
+          IMAGE="${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          if [[ -f "k8s/frontend-deployment.yaml" ]]; then
+            sed "s|image: .*/frontend:.*|image: $IMAGE|g" k8s/frontend-deployment.yaml > temp-deployment.yaml
+            kubectl apply -f temp-deployment.yaml -n ${{ env.NAMESPACE }}
+            rm temp-deployment.yaml
+          else
+            kubectl apply -f - <<EOF
+          apiVersion: apps/v1
+          kind: Deployment
+          metadata:
+            name: frontend-deployment
+            namespace: ${{ env.NAMESPACE }}
+            labels:
+              app: frontend
+          spec:
+            replicas: 2
+            selector:
+              matchLabels:
+                app: frontend
+            template:
+              metadata:
+                labels:
+                  app: frontend
+              spec:
+                serviceAccountName: frontend-sa
+                containers:
+                - name: frontend
+                  image: $IMAGE
+                  ports:
+                    - containerPort: 80
+          EOF
+          fi
+
+      - name: Apply Service
+        run: |
+          if [[ -f "k8s/frontend-service.yaml" ]]; then
+            kubectl apply -f k8s/frontend-service.yaml -n ${{ env.NAMESPACE }}
+          else
+            kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: frontend
+            namespace: ${{ env.NAMESPACE }}
+          spec:
+            selector:
+              app: frontend
+            ports:
+              - protocol: TCP
+                port: 80
+                targetPort: 80
+            type: ClusterIP
+          EOF
+          fi
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
