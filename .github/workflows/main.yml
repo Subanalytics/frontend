@@ -2,15 +2,13 @@ name: CI/CD - Frontend Service OneClick
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
     paths-ignore:
       - 'k8s/**'
       - 'README.md'
       - 'docs/**'
   pull_request:
-    branches:
-      - main
+    branches: [main]
   workflow_dispatch:
     inputs:
       skip_tests:
@@ -33,23 +31,15 @@ env:
   SERVICE_NAME: frontend
   NAMESPACE: analytics
 
-permissions:
-  contents: read
-
 jobs:
-  # ======================
-  # CI Stage - Build & Test
-  # ======================
   ci-build-test:
     runs-on: ubuntu-latest
     if: github.event.inputs.skip_tests != 'true'
     outputs:
       image-tag: ${{ steps.build-info.outputs.image-tag }}
       git-sha: ${{ steps.build-info.outputs.git-sha }}
-      should-deploy: ${{ steps.build-info.outputs.should-deploy }}
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Setup Node.js v18
         uses: actions/setup-node@v4
@@ -64,8 +54,9 @@ jobs:
         continue-on-error: true
         run: npm run lint || echo "Linting completed with warnings"
 
-      - name: Run tests
+      - name: Run tests safely
         run: |
+          set -e
           if npm run test:coverage 2>/dev/null; then
             echo "✅ Tests with coverage completed"
           elif npm test 2>/dev/null; then
@@ -80,7 +71,6 @@ jobs:
           IMAGE_TAG="${GIT_SHA}-$(date +%s)"
           echo "git-sha=$GIT_SHA" >> $GITHUB_OUTPUT
           echo "image-tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
-          echo "should-deploy=true" >> $GITHUB_OUTPUT
 
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -103,30 +93,24 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-  # ======================
-  # CD Stage - Deploy to Kubernetes
-  # ======================
   cd-deploy:
     runs-on: self-hosted
     needs: ci-build-test
     if: always() && (needs.ci-build-test.result == 'success' || github.event.inputs.skip_tests == 'true')
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Set deployment variables
         run: |
-          if [ "${{ github.event.inputs.skip_tests }}" == "true" ]; then
+          if [ "${{ github.event.inputs.skip_tests }}" = "true" ]; then
             IMAGE_TAG=latest
             GIT_SHA=$(git rev-parse --short HEAD)
           else
             IMAGE_TAG=${{ needs.ci-build-test.outputs.image-tag }}
             GIT_SHA=${{ needs.ci-build-test.outputs.git-sha }}
           fi
-
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
-
           DEPLOY_ENV="${{ github.event.inputs.environment }}"
           echo "NAMESPACE=${DEPLOY_ENV:-analytics}" >> $GITHUB_ENV
 
@@ -174,20 +158,14 @@ jobs:
         run: |
           IMAGE="${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           echo "Deploying frontend with image: $IMAGE"
-
-          # Update existing deployment or apply new
-          if kubectl get deployment frontend-deployment -n ${{ env.NAMESPACE }} >/dev/null 2>&1; then
-            kubectl set image deployment/frontend-deployment frontend=$IMAGE -n ${{ env.NAMESPACE }}
-          else
-            kubectl apply -f k8s/frontend-deployment.yaml -n ${{ env.NAMESPACE }}
-          fi
-
-          # Wait for rollout
+          TEMP_DEPLOYMENT=$(mktemp)
+          sed "s|image: tush1809/frontend:latest|image: $IMAGE|g" k8s/frontend-deployment.yaml > $TEMP_DEPLOYMENT
+          kubectl apply -f $TEMP_DEPLOYMENT -n ${{ env.NAMESPACE }}
+          rm $TEMP_DEPLOYMENT
           kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
 
       - name: Verify Deployment
         run: |
-          echo "=== Frontend Deployment Status ==="
           kubectl get deployment frontend-deployment -n ${{ env.NAMESPACE }} -o wide
           kubectl get pods -l app=frontend -n ${{ env.NAMESPACE }} -o wide
           kubectl get svc frontend-service -n ${{ env.NAMESPACE }} -o wide
