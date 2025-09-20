@@ -37,6 +37,7 @@ permissions:
   contents: read
 
 jobs:
+
   # ======================
   # CI Stage - Build & Test
   # ======================
@@ -60,10 +61,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Run linter
-        run: npm run lint || true   # Will not fail the workflow
-
-      - name: Run tests safely
+      - name: Run unit tests safely
         run: |
           bash -e <<'EOF'
           if npm run test:coverage 2>/dev/null; then
@@ -74,6 +72,20 @@ jobs:
             echo "⚠️ No test script found, skipping tests"
           fi
           EOF
+
+      - name: Run linter safely
+        run: npm run lint || echo "⚠️ Lint issues detected, continuing workflow"
+
+      - name: Run SAST (CodeQL) safely
+        uses: github/codeql-action/analyze@v2
+        continue-on-error: true
+
+      - name: Run SCA / Secret Scanning safely
+        run: |
+          echo "Running SCA and secret scanning..."
+          # Example using npm audit
+          npm audit --audit-level=high || echo "⚠️ SCA issues detected, continuing workflow"
+        continue-on-error: true
 
       - name: Set build info
         id: build-info
@@ -127,7 +139,6 @@ jobs:
           fi
           echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
           echo "GIT_SHA=$GIT_SHA" >> $GITHUB_ENV
-
           DEPLOY_ENV="${{ github.event.inputs.environment }}"
           echo "NAMESPACE=${DEPLOY_ENV:-analytics}" >> $GITHUB_ENV
 
@@ -175,20 +186,29 @@ jobs:
         run: |
           IMAGE="${{ env.DOCKER_IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
           echo "Deploying frontend with image: $IMAGE"
-
-          # Replace image in temp file
           TEMP_DEPLOYMENT=$(mktemp)
           sed "s|image: tush1809/frontend:latest|image: $IMAGE|g" k8s/frontend-deployment.yaml > $TEMP_DEPLOYMENT
-
           kubectl apply -f $TEMP_DEPLOYMENT -n ${{ env.NAMESPACE }}
           rm $TEMP_DEPLOYMENT
-
-          # Wait for rollout
           kubectl rollout status deployment/frontend-deployment -n ${{ env.NAMESPACE }} --timeout=300s
+
+      - name: Deploy HPA
+        run: |
+          if [ -f k8s/frontend-hpa.yaml ]; then
+            kubectl apply -f k8s/frontend-hpa.yaml -n ${{ env.NAMESPACE }}
+          else
+            echo "⚠️ HPA manifest not found, skipping"
+          fi
 
       - name: Verify Deployment
         run: |
-          echo "=== Frontend Deployment Status ==="
           kubectl get deployment frontend-deployment -n ${{ env.NAMESPACE }} -o wide
           kubectl get pods -l app=frontend -n ${{ env.NAMESPACE }} -o wide
           kubectl get svc frontend-service -n ${{ env.NAMESPACE }} -o wide
+
+      - name: Run DAST safely (OWASP ZAP)
+        run: |
+          echo "Running DAST scan..."
+          # Example: zap-cli quick-scan against staging or analytics environment
+          zap-cli quick-scan --self-contained --start-options '-config api.disablekey=true' http://frontend-service.${{ env.NAMESPACE }}.svc.cluster.local:3000 || echo "⚠️ DAST scan issues detected, continuing workflow"
+        continue-on-error: true
