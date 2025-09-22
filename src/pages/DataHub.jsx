@@ -2,8 +2,8 @@ import React, { useState, useEffect } from "react";
 import Header from "../components/Header";
 import FileUpload from "../components/FileUpload";
 
-// 1. Import your new, configured 'analyticsApi' instance
-import { analyticsApi } from '../api/axios'; 
+// Import your configured API instance
+import { uploadApi } from '../api/axios'; 
 
 import "./DataHub.css";
 
@@ -16,8 +16,8 @@ const DataHub = () => {
       setLoading(true);
       setHistory(null); // Clear previous history
       try {
-        // 2. Use 'analyticsApi' to get history from the correct service
-        const response = await analyticsApi.get('/api/predict/get-history');
+        // Use 'uploadApi' to get history from the correct service
+        const response = await uploadApi.get('/api/predict/get-history');
         
         // Update state with the fetched history
         setHistory(response.data?.history);
@@ -73,4 +73,3 @@ const DataHub = () => {
 };
 
 export default DataHub;
-
