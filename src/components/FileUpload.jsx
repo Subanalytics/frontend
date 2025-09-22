@@ -1,8 +1,6 @@
 import React, { useState } from "react";
-import axios from "axios";
+import { uploadApi } from "../api/axios";
 import "./fileUpload.css";
-
-const API_URL = import.meta.env.VITE_API_URL;
 
 const FileUpload = () => {
   const [file, setFile] = useState(null);
@@ -21,18 +19,23 @@ const FileUpload = () => {
     setSuccess(null);
     setError(null);
 
+    if (!file) {
+      setError("Please select a file first");
+      setLoading(false);
+      return;
+    }
+
     const formData = new FormData();
     formData.append("file", file);
 
     try {
-      const response = await axios.post(
-        `${API_URL}/api/predict`,
+      const response = await uploadApi.post(
+        "/api/predict",
         formData,
         {
           headers: {
             "Content-Type": "multipart/form-data",
-          },
-          withCredentials: true,
+          }
         }
       );
       setSuccess("File uploaded and analyzed successfully!");
